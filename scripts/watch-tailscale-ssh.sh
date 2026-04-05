@@ -8,6 +8,7 @@ command_name="${1:-start}"
 peer_ip="${2:-100.82.42.75}"
 peer_port="${3:-22}"
 base_interval="${4:-180}"
+max_interval="${MAX_INTERVAL_SECONDS:-3600}"
 
 label="com.lwq.tailscale-ssh-heal"
 plist_path="${HOME}/Library/LaunchAgents/${label}.plist"
@@ -36,13 +37,22 @@ CONSECUTIVE_FAILURES=$2
 LAST_RESULT=$3
 NEXT_CHECK_AT=$4
 LAST_CHECK_AT=$5
+LAST_RESET_DAY=$6
 EOF
 }
 
 load_state() {
   if [[ -f "$state_file" ]]; then
-    # shellcheck disable=SC1090
-    source "$state_file"
+    while IFS='=' read -r key value; do
+      case "$key" in
+        CURRENT_INTERVAL) CURRENT_INTERVAL="$value" ;;
+        CONSECUTIVE_FAILURES) CONSECUTIVE_FAILURES="$value" ;;
+        LAST_RESULT) LAST_RESULT="$value" ;;
+        NEXT_CHECK_AT) NEXT_CHECK_AT="$value" ;;
+        LAST_CHECK_AT) LAST_CHECK_AT="$value" ;;
+        LAST_RESET_DAY) LAST_RESET_DAY="$value" ;;
+      esac
+    done < "$state_file"
   fi
 
   CURRENT_INTERVAL="${CURRENT_INTERVAL:-$base_interval}"
@@ -50,6 +60,7 @@ load_state() {
   LAST_RESULT="${LAST_RESULT:-unknown}"
   NEXT_CHECK_AT="${NEXT_CHECK_AT:-0}"
   LAST_CHECK_AT="${LAST_CHECK_AT:-0}"
+  LAST_RESET_DAY="${LAST_RESET_DAY:-$(date '+%F')}"
 }
 
 format_epoch() {
@@ -145,6 +156,21 @@ run_once() {
   load_state
 
   now="$(date +%s)"
+  current_day="$(date '+%F')"
+
+  if [[ "$LAST_RESET_DAY" != "$current_day" ]]; then
+    if [[ "$CURRENT_INTERVAL" -ne "$base_interval" || "$CONSECUTIVE_FAILURES" -ne 0 ]]; then
+      log_block \
+        "每日重置已执行" \
+        "检测目标：${peer_ip}:${peer_port}" \
+        "说明：已跨过新的一天，检查间隔恢复为 ${base_interval} 秒，连续异常次数清零"
+    fi
+    CURRENT_INTERVAL="$base_interval"
+    CONSECUTIVE_FAILURES=0
+    LAST_RESET_DAY="$current_day"
+    NEXT_CHECK_AT=0
+  fi
+
   if [[ "$NEXT_CHECK_AT" -gt "$now" ]]; then
     exit 0
   fi
@@ -173,11 +199,15 @@ run_once() {
 
         if (( CONSECUTIVE_FAILURES % 2 == 0 )); then
           CURRENT_INTERVAL=$((CURRENT_INTERVAL * 2))
+          if (( CURRENT_INTERVAL > max_interval )); then
+            CURRENT_INTERVAL="$max_interval"
+          fi
           log_block \
             "退避策略已触发" \
             "检测目标：${peer_ip}:${peer_port}" \
             "原因：连续两次检查都异常并触发了重启" \
-            "新的检查间隔：${CURRENT_INTERVAL} 秒"
+            "新的检查间隔：${CURRENT_INTERVAL} 秒" \
+            "最大检查间隔上限：${max_interval} 秒"
         fi
         ;;
       20)
@@ -223,16 +253,17 @@ run_once() {
   fi
 
   NEXT_CHECK_AT=$((LAST_CHECK_AT + CURRENT_INTERVAL))
-  write_state "$CURRENT_INTERVAL" "$CONSECUTIVE_FAILURES" "$LAST_RESULT" "$NEXT_CHECK_AT" "$LAST_CHECK_AT"
+  write_state "$CURRENT_INTERVAL" "$CONSECUTIVE_FAILURES" "$LAST_RESULT" "$NEXT_CHECK_AT" "$LAST_CHECK_AT" "$LAST_RESET_DAY"
 }
 
 start_agent() {
-  write_state "$base_interval" 0 "starting" 0 0
+  write_state "$base_interval" 0 "starting" 0 0 "$(date '+%F')"
   write_plist
   log_block \
     "后台巡检已启动" \
     "检测目标：${peer_ip}:${peer_port}" \
     "基础间隔：${base_interval} 秒" \
+    "最大检查间隔：${max_interval} 秒" \
     "调度方式：launchd StartInterval 单次执行；若睡眠期间错过检查点，唤醒后由 launchd 尽快补跑一次"
   launchctl bootout "gui/${uid}" "$plist_path" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/${uid}" "$plist_path"
@@ -268,8 +299,10 @@ status_agent() {
 
   echo "Scheduler mode: launchd StartInterval one-shot"
   echo "Current interval: ${CURRENT_INTERVAL}s"
+  echo "Max interval: ${max_interval}s"
   echo "Consecutive failures: ${CONSECUTIVE_FAILURES}"
   echo "Last result: ${LAST_RESULT}"
+  echo "Last reset day: ${LAST_RESET_DAY}"
   echo "Last check at: $(format_epoch "$LAST_CHECK_AT")"
   echo "Next eligible check: $(format_epoch "$NEXT_CHECK_AT")"
   echo "Log file: $log_file"

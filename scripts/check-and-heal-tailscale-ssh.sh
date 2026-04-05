@@ -14,6 +14,33 @@ peer_ip="${1:-100.82.42.75}"
 peer_port="${2:-22}"
 restart_script="${script_dir}/restart-tailscale.sh"
 
+run_capture_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+
+  python3 - "$timeout_seconds" "$@" <<'PY'
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+cmd = sys.argv[2:]
+
+try:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+except subprocess.TimeoutExpired as exc:
+    if exc.stdout:
+        sys.stdout.write(exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode())
+    if exc.stderr:
+        sys.stderr.write(exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode())
+    print(f"timeout after {timeout:g}s", file=sys.stderr)
+    sys.exit(124)
+
+sys.stdout.write(proc.stdout)
+sys.stderr.write(proc.stderr)
+sys.exit(proc.returncode)
+PY
+}
+
 tailscale_bin=""
 for candidate in /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
   if [[ -x "$candidate" ]]; then
@@ -36,7 +63,12 @@ if [[ ! -x "$restart_script" ]]; then
   exit 1
 fi
 
-status_json="$("$tailscale_bin" status --json 2>/dev/null || true)"
+status_json="$(run_capture_with_timeout 8 "$tailscale_bin" status --json 2>/dev/null || true)"
+if [[ -n "$status_json" ]]; then
+  backend_query_ok=1
+else
+  backend_query_ok=0
+fi
 backend_state="$(printf '%s' "$status_json" | tr -d '\n' | sed -nE 's/.*"BackendState"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
 backend_state="${backend_state:-未知}"
 
@@ -74,6 +106,7 @@ print_healthy() {
     echo "检查结果：正常"
     echo "检测目标：${peer_ip}:${peer_port}"
     echo "BackendState：${backend_state}"
+    echo "BackendState 查询：$([[ "$backend_query_ok" -eq 1 ]] && echo 正常 || echo 超时或失败)"
     echo "本机 Tailscale 地址：${tailscale_ip:-未知}"
     echo "Tailscale 接口：${tailscale_iface:-未知}"
     echo "目标路由接口：${peer_iface:-未知}"
@@ -88,6 +121,7 @@ print_restart_reason() {
   echo "检测目标：${peer_ip}:${peer_port}"
   echo "异常归类：$1"
   echo "BackendState：${backend_state}"
+  echo "BackendState 查询：$([[ "$backend_query_ok" -eq 1 ]] && echo 正常 || echo 超时或失败)"
   echo "本机 Tailscale 地址：${tailscale_ip:-未知}"
   echo "Tailscale 接口：${tailscale_iface:-未知}"
   echo "目标路由接口：${peer_iface:-未知}"
@@ -104,6 +138,7 @@ print_no_restart_reason() {
   echo "检测目标：${peer_ip}:${peer_port}"
   echo "异常归类：$1"
   echo "BackendState：${backend_state}"
+  echo "BackendState 查询：$([[ "$backend_query_ok" -eq 1 ]] && echo 正常 || echo 超时或失败)"
   echo "本机 Tailscale 地址：${tailscale_ip:-未知}"
   echo "Tailscale 接口：${tailscale_iface:-未知}"
   echo "目标路由接口：${peer_iface:-未知}"
@@ -113,12 +148,12 @@ print_no_restart_reason() {
   echo "处理动作：保守处理，不重启本机 Tailscale"
 }
 
-if [[ "$backend_state" == "Running" && -n "$tailscale_ip" && -n "$tailscale_iface" && "$route_ok" -eq 1 && "$port_ok" -eq 1 ]]; then
+if [[ ( "$backend_state" == "Running" || "$backend_query_ok" -eq 0 ) && -n "$tailscale_ip" && -n "$tailscale_iface" && "$route_ok" -eq 1 && "$port_ok" -eq 1 ]]; then
   print_healthy
   exit 0
 fi
 
-if [[ "$backend_state" != "Running" || -z "$tailscale_ip" || -z "$tailscale_iface" ]]; then
+if [[ ( "$backend_query_ok" -eq 1 && "$backend_state" != "Running" ) || -z "$tailscale_ip" || -z "$tailscale_iface" ]]; then
   print_restart_reason "本机 Tailscale 服务或本地隧道状态异常"
   exit 10
 fi
@@ -141,6 +176,7 @@ fi
 echo "检查脚本未能归类当前状态，请人工复查。"
 echo "检测目标：${peer_ip}:${peer_port}"
 echo "BackendState：${backend_state}"
+echo "BackendState 查询：$([[ "$backend_query_ok" -eq 1 ]] && echo 正常 || echo 超时或失败)"
 echo "本机 Tailscale 地址：${tailscale_ip:-未知}"
 echo "Tailscale 接口：${tailscale_iface:-未知}"
 echo "目标路由接口：${peer_iface:-未知}"
